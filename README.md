@@ -1,5 +1,9 @@
 # Markdown to 飞书同步工具
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
+[![GitHub stars](https://img.shields.io/github/stars/Aojianlong/markdown-to-feishu.svg)](https://github.com/Aojianlong/markdown-to-feishu/stargazers)
+
 一键将 Markdown 文章（含本地图片）自动同步到飞书云文档。
 
 > 💡 **适合人群**：使用 Markdown 编辑器（Obsidian、Typora、VS Code 等）做笔记，想要快速分享到飞书的用户
@@ -54,7 +58,7 @@ pip install -r requirements.txt
 
 1. 访问 [飞书开放平台](https://open.feishu.cn/app)
 2. 点击「**创建企业自建应用**」
-3. 填写应用名称（如：`Obsidian 同步工具`）
+3. 填写应用名称（如：`Markdown 同步工具`）
 4. 在「**凭证与基础信息**」页面，复制 **App ID** 和 **App Secret**
 
 **2.2 配置应用权限**
@@ -468,7 +472,7 @@ print("Hello")
 **在 Claude Code 中发送**：
 
 ```
-请检查文件 D:\obsidian\notes\我的文章.md 是否存在
+请检查文件 D:\notes\我的文章.md 是否存在
 ```
 
 ### 2. 检查图片文件夹
@@ -476,7 +480,7 @@ print("Hello")
 **在 Claude Code 中发送**：
 
 ```
-请检查 D:\obsidian\notes\images\ 文件夹是否存在，并列出其中的图片
+请检查 D:\notes\images\ 文件夹是否存在，并列出其中的图片
 ```
 
 ### 3. 测试飞书连接
@@ -484,7 +488,7 @@ print("Hello")
 **在 Claude Code 中发送**：
 
 ```
-请测试 obsidian-to-feishu 的飞书 API 连接
+请测试 markdown-to-feishu 的飞书 API 连接
 ```
 
 ### 4. 查看详细错误
@@ -492,7 +496,7 @@ print("Hello")
 如果同步失败，复制完整的错误信息发送给 Claude：
 
 ```
-obsidian-to-feishu 同步失败了，错误信息是：[粘贴错误信息]，请帮我分析原因
+markdown-to-feishu 同步失败了，错误信息是：[粘贴错误信息]，请帮我分析原因
 ```
 
 ---
