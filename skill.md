@@ -1,11 +1,11 @@
 ---
-name: obsidian-to-feishu
-description: 将 Obsidian Markdown 文章（含本地图片）同步到飞书云文档
+name: markdown-to-feishu
+description: 将 Markdown 文章（含本地图片）同步到飞书云文档
 ---
 
-# Obsidian to 飞书同步
+# Markdown to 飞书同步
 
-将 Obsidian Markdown 文章转换并上传到飞书云文档，自动处理图片上传和格式转换。
+将 Markdown 文章转换并上传到飞书云文档，自动处理图片上传和格式转换。
 
 ## 功能特性
 
@@ -21,15 +21,15 @@ description: 将 Obsidian Markdown 文章（含本地图片）同步到飞书云
 
 ```bash
 # 同步单个文档
-/obsidian-to-feishu <markdown-file-path>
+/markdown-to-feishu <markdown-file-path>
 
 # 示例
-/obsidian-to-feishu "D:\obsidian\notes\Projects\article.md"
+/markdown-to-feishu "D:\obsidian\notes\Projects\article.md"
 ```
 
 ### 参数说明
 
-- `<markdown-file-path>`: Obsidian Markdown 文件的完整路径
+- `<markdown-file-path>`: Markdown 文件的完整路径（支持 Obsidian、Typora 等任何 Markdown 编辑器）
 - 图片必须放在与 Markdown 文件同级的 `images/` 目录下
 
 ## 首次使用配置
@@ -40,7 +40,7 @@ description: 将 Obsidian Markdown 文章（含本地图片）同步到飞书云
 2. 获取 App ID 和 App Secret
 3. 运行配置命令：
    ```bash
-   cd ~/.claude/skills/obsidian-to-feishu
+   cd ~/.claude/skills/markdown-to-feishu
    python setup.py init
    ```
 
