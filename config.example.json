@@ -1,0 +1,12 @@
+{
+  "feishu": {
+    "app_id": "YOUR_APP_ID_HERE",
+    "app_secret": "YOUR_APP_SECRET_HERE"
+  },
+  "default_image_width": 800,
+  "width_mapping": {
+    "w50": 50,
+    "w30": 30,
+    "w100": 100
+  }
+}
