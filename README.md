@@ -190,12 +190,6 @@ def setup_config():
     config = load_config("config.json")
     return config
 ```
-
-## 参考链接
-
-详细教程请参考：[官方文档](https://example.com/docs)
-```
-
 ---
 
 ## 🎨 支持的 Markdown 语法
