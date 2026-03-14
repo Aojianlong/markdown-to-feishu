@@ -8,24 +8,26 @@ import json
 import time
 from pathlib import Path
 from typing import Dict, List
+from urllib.parse import unquote, urlparse
 
 from tools.markdown_parser import MarkdownParser
 from tools.feishu_uploader import FeishuUploader
 from tools.block_converter import BlockConverter
+from config_utils import load_runtime_config
 
 
 def load_config() -> Dict:
     """加载配置文件"""
-    config_path = Path(__file__).parent / 'config.json'
+    config = load_runtime_config()
 
-    if not config_path.exists():
+    if not config:
         print("错误：配置文件不存在！")
-        print("请先运行: python setup.py init")
+        print("请先运行: python scripts/setup.py init")
         sys.exit(1)
 
     try:
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = json.load(f)
+        # 通过一次序列化校验配置对象可被 JSON 正常表示
+        json.dumps(config, ensure_ascii=False)
     except json.JSONDecodeError as e:
         print(f"错误：配置文件格式无效: {e}")
         sys.exit(1)
@@ -42,6 +44,68 @@ def load_config() -> Dict:
         sys.exit(1)
 
     return config
+
+
+def resolve_local_image_path(md_path: Path, raw_path: str) -> Path:
+    """根据 Markdown 文件目录解析本地图片路径。"""
+    normalized = unquote(raw_path.strip())
+    parsed = urlparse(normalized)
+
+    if parsed.scheme and len(parsed.scheme) > 1:
+        raise ValueError(f"暂不支持远程图片路径: {raw_path}")
+
+    candidate = Path(normalized)
+    if candidate.is_absolute():
+        return candidate
+
+    return (md_path.parent / candidate).resolve()
+
+
+def preflight_local_images(md_path: Path, parsed_data: List[Dict]) -> Dict[int, Dict]:
+    """预检 Markdown 中引用的本地图片，避免先建空块再失败。"""
+    results = {}
+
+    for index, item in enumerate(parsed_data):
+        if item.get('type') != 'image':
+            continue
+
+        raw_path = item.get('path', '')
+
+        try:
+            resolved_path = resolve_local_image_path(md_path, raw_path)
+        except ValueError as e:
+            results[index] = {
+                'ok': False,
+                'raw_path': raw_path,
+                'error': str(e)
+            }
+            continue
+
+        if not resolved_path.exists():
+            results[index] = {
+                'ok': False,
+                'raw_path': raw_path,
+                'resolved_path': str(resolved_path),
+                'error': f"图片不存在: {resolved_path}"
+            }
+            continue
+
+        if not resolved_path.is_file():
+            results[index] = {
+                'ok': False,
+                'raw_path': raw_path,
+                'resolved_path': str(resolved_path),
+                'error': f"路径不是文件: {resolved_path}"
+            }
+            continue
+
+        results[index] = {
+            'ok': True,
+            'raw_path': raw_path,
+            'path': resolved_path
+        }
+
+    return results
 
 
 def validate_config(config: Dict) -> List[str]:
@@ -125,8 +189,6 @@ def sync_to_feishu(md_file_path: str) -> str:
     if md_path.suffix.lower() != '.md':
         raise ValueError(f"文件必须是 .md 格式: {md_file_path}")
 
-    images_dir = md_path.parent / "images"
-
     print(f"开始同步文档: {md_path.name}")
     print("-" * 60)
 
@@ -135,6 +197,18 @@ def sync_to_feishu(md_file_path: str) -> str:
     parser = MarkdownParser()
     parsed_data = parser.parse_file(md_path)
     print(f"[OK] 解析完成，共 {len(parsed_data)} 个元素")
+
+    image_preflight = preflight_local_images(md_path, parsed_data)
+    failed_images = [
+        (index, info) for index, info in image_preflight.items()
+        if not info['ok']
+    ]
+    if failed_images:
+        print(f"[WARNING] 图片预检发现 {len(failed_images)} 个问题，上传时会跳过这些图片以避免生成空块：")
+        for index, info in failed_images[:10]:
+            print(f"  - 第 {index + 1} 项 {info['raw_path']}: {info['error']}")
+        if len(failed_images) > 10:
+            print(f"  - 其余 {len(failed_images) - 10} 个问题已省略")
 
     # Step 2: 创建飞书文档
     uploader = FeishuUploader(app_id, app_secret)
@@ -174,276 +248,352 @@ def sync_to_feishu(md_file_path: str) -> str:
         batch = []
         batch_start_idx = 0
 
-        def should_flush_batch(current_item, last_item_in_batch):
-            """判断是否需要提交当前批次"""
+        def get_validated_image_path(image_index: int, image_item: Dict) -> Path | None:
+            """读取图片预检结果，仅对当前要处理的图片做一次判断。"""
+            info = image_preflight.get(image_index)
+            if not info:
+                print(f"    [X] 缺少图片预检结果: {image_item.get('path', '')}")
+                return None
 
-            # 如果批次为空,不需要提交
-            if not batch or not last_item_in_batch:
+            if not info['ok']:
+                print(f"    [SKIP] 跳过图片 {image_item.get('path', '')}: {info['error']}")
+                return None
+
+            return info['path']
+
+        # 收集 mermaid 数据（用于 Tier 2 输出）
+        mermaid_blocks_data = []
+
+        def calc_col_widths(all_rows, total_width=1093):
+            """根据每列最大内容长度按比例计算列宽"""
+            col_count = len(all_rows[0]) if all_rows else 0
+            if col_count == 0:
+                return []
+            max_lens = [0] * col_count
+            for row in all_rows:
+                for i, cell in enumerate(row):
+                    if i < col_count:
+                        cell_len = len(str(cell)) if cell else 0
+                        max_lens[i] = max(max_lens[i], cell_len)
+            # 保底每列至少算 1 个字符
+            max_lens = [max(1, l) for l in max_lens]
+            total_len = sum(max_lens)
+            widths = [max(50, int(total_width * l / total_len)) for l in max_lens]
+            return widths
+
+        def should_flush_batch(current_item):
+            """判断是否需要提交当前批次"""
+            if not batch:
                 return False
 
-            # API 限制：单次最多添加 50 个块
             if len(batch) >= 50:
                 return True
 
-            # 如果遇到图片，必须先提交批次
-            if current_item['type'] == 'image':
-                return True
-
-            # 如果遇到表格，必须先提交批次
-            if current_item['type'] == 'table':
-                return True
-
             current_type = current_item['type']
-            last_type = last_item_in_batch['type']
 
-            # 如果上一项是有序列表
-            if last_type == 'ordered':
-                # 当前项也是有序列表且同级别,继续累积
-                if current_type == 'ordered':
-                    current_indent = current_item.get('indent', 0)
-                    last_indent = last_item_in_batch.get('indent', 0)
-                    if current_indent == last_indent:
-                        return False  # 继续累积同级别的有序列表
-
-                # 当前项不是有序列表,或者缩进不同,提交批次
+            # 特殊类型需要先提交当前批次
+            if current_type in ('image', 'table', 'html_table', 'mermaid', 'ordered', 'bullet'):
                 return True
 
-            # 其他情况根据具体需求判断
-            # 一般策略:累积到一定数量再提交,或遇到图片/特殊元素
             return False
 
         for idx, (item, block) in enumerate(zip(parsed_data, blocks)):
-            last_item_in_batch = parsed_data[idx - 1] if idx > 0 and batch else None
-
             # 判断是否需要提交当前批次
-            if batch and should_flush_batch(item, last_item_in_batch):
+            if batch and should_flush_batch(item):
                 print(f"  添加批次 ({batch_start_idx+1}-{batch_start_idx+len(batch)})...")
                 uploader.add_blocks_to_document(document_id, batch)
                 processed += len(batch)
                 batch = []
                 batch_start_idx = idx
-                time.sleep(0.3)  # 避免API限流
+                time.sleep(0.3)
 
-            if item['type'] == 'image':
-                # 检查是否是连续图片组(用于并排显示)
-                consecutive_images = [item]
-                consecutive_indices = [idx]
+            # === 章节标题前插入空行（H1/H2）===
+            if item['type'] == 'heading' and item.get('level', 99) <= 2 and idx > 0:
+                empty_block = {
+                    "block_type": 2,
+                    "text": {
+                        "elements": [{"text_run": {"content": " "}}]
+                    }
+                }
+                batch.append(empty_block)
 
-                # 向前查找连续的图片
+            # === 列表组处理（有序/无序）===
+            if item['type'] in ('ordered', 'bullet'):
+                # 收集连续的列表项（可以混合 ordered 和 bullet，但实际上
+                # 应该按连续的同类型分组；这里我们按"连续的列表类型"分组）
+                list_group = [(idx, item, block)]
                 j = idx + 1
-                while j < len(parsed_data) and parsed_data[j]['type'] == 'image':
-                    consecutive_images.append(parsed_data[j])
-                    consecutive_indices.append(j)
+                while j < len(parsed_data) and parsed_data[j]['type'] in ('ordered', 'bullet'):
+                    list_group.append((j, parsed_data[j], blocks[j]))
                     j += 1
 
-                # 如果有多张连续图片,使用Grid分栏布局(最多5列)
-                if len(consecutive_images) > 1:
-                    print(f"  [{idx+1}-{j}/{total_items}] 处理并排图片组 ({len(consecutive_images)}张)")
-
-                    # 飞书Grid最多支持5列,需要智能分批处理
-                    MAX_GRID_COLUMNS = 5
-                    total_images = len(consecutive_images)
-
-                    # 计算最佳分批方案
-                    if total_images <= MAX_GRID_COLUMNS:
-                        # 5张及以下,单行显示
-                        img_batches = [consecutive_images]
+                # 按连续的同类型子组拆分（ordered 和 bullet 不混合）
+                sub_groups = []
+                current_sub = [list_group[0]]
+                for k in range(1, len(list_group)):
+                    if list_group[k][1]['type'] == current_sub[-1][1]['type']:
+                        current_sub.append(list_group[k])
                     else:
-                        # 超过5张,分成多行,尽量均匀分布
-                        # 计算需要多少行
+                        sub_groups.append(current_sub)
+                        current_sub = [list_group[k]]
+                sub_groups.append(current_sub)
+
+                for sub_group in sub_groups:
+                    list_type = sub_group[0][1]['type']
+                    list_items = []
+                    for _, li_item, li_block in sub_group:
+                        list_items.append({
+                            'type': li_item['type'],
+                            'indent': li_item.get('indent', 0),
+                            'segments': li_item.get('segments', [{'text': li_item.get('content', ' ')}]),
+                            'block': li_block
+                        })
+
+                    print(f"  [{sub_group[0][0]+1}-{sub_group[-1][0]+1}/{total_items}] 创建嵌套{list_type}列表 ({len(list_items)} 项)...")
+                    try:
+                        uploader.create_nested_list(document_id, list_items, converter)
+                        processed += len(list_items)
+                        print(f"    [OK] 列表创建成功")
+                    except Exception as e:
+                        print(f"    [X] 列表创建失败: {e}")
+                        # fallback: 逐个添加为扁平块
+                        print(f"    [FALLBACK] 尝试逐个添加...")
+                        flat_blocks = [li_block for _, _, li_block in sub_group]
+                        try:
+                            uploader.add_blocks_to_document(document_id, flat_blocks)
+                            processed += len(flat_blocks)
+                            print(f"    [OK] 扁平列表添加成功")
+                        except Exception as e2:
+                            print(f"    [X] 扁平列表也失败: {e2}")
+
+                    time.sleep(0.3)
+
+                # 标记后续列表项为已处理
+                for skip_idx, _, _ in list_group[1:]:
+                    if skip_idx < len(parsed_data):
+                        parsed_data[skip_idx] = {'type': 'skip'}
+
+                batch_start_idx = j
+
+            # === 图片处理 ===
+            elif item['type'] == 'image':
+                consecutive_images = [(idx, item)]
+                j = idx + 1
+                while j < len(parsed_data) and parsed_data[j]['type'] == 'image':
+                    consecutive_images.append((j, parsed_data[j]))
+                    j += 1
+
+                valid_consecutive_images = []
+                invalid_count = 0
+                for image_index, image_item in consecutive_images:
+                    image_path = get_validated_image_path(image_index, image_item)
+                    if image_path is None:
+                        invalid_count += 1
+                        continue
+                    valid_consecutive_images.append((image_index, image_item, image_path))
+
+                if invalid_count:
+                    print(f"  [INFO] 连续图片组中有 {invalid_count} 张图片预检失败，已跳过")
+
+                if len(valid_consecutive_images) > 1:
+                    print(f"  [{idx+1}-{j}/{total_items}] 处理并排图片组 ({len(valid_consecutive_images)}张有效图片)")
+                    MAX_GRID_COLUMNS = 5
+                    total_images = len(valid_consecutive_images)
+
+                    if total_images <= MAX_GRID_COLUMNS:
+                        img_batches = [valid_consecutive_images]
+                    else:
                         num_rows = (total_images + MAX_GRID_COLUMNS - 1) // MAX_GRID_COLUMNS
-
-                        # 计算每行的图片数量(尽量均匀)
-                        base_count = total_images // num_rows  # 每行基础数量
-                        extra_count = total_images % num_rows  # 多余的图片数
-
+                        base_count = total_images // num_rows
+                        extra_count = total_images % num_rows
                         img_batches = []
                         start_idx = 0
                         for row in range(num_rows):
-                            # 前面的行多分配1张(如果有多余的)
                             count = base_count + (1 if row < extra_count else 0)
-                            img_batches.append(consecutive_images[start_idx:start_idx + count])
+                            img_batches.append(valid_consecutive_images[start_idx:start_idx + count])
                             start_idx += count
 
                     for batch_idx, img_batch in enumerate(img_batches):
-                        # 如果批次只有1张图片,按单张处理
                         if len(img_batch) == 1:
-                            img_item = img_batch[0]
+                            img_idx, img_item, image_path = img_batch[0]
                             img_block = converter._create_image_block(img_item, {})
-
                             blocks_info = uploader.add_blocks_to_document(document_id, [img_block])
                             if not blocks_info:
                                 print(f"      [X] 创建图片块失败")
                                 continue
-
                             image_block_id = blocks_info[0]['block_id']
-                            image_path = images_dir / img_item['path'].replace('images/', '')
-
-                            if not image_path.exists():
-                                print(f"      [X] 图片不存在: {image_path}")
-                                continue
-
                             try:
                                 uploader.upload_image_to_block(image_path, document_id, image_block_id)
                                 print(f"      [OK] 单张图片上传成功")
+                                processed += 1
                             except Exception as e:
                                 print(f"      [X] 上传失败: {e}")
-
+                                uploader.delete_block(document_id, image_block_id)
                             time.sleep(0.2)
                             continue
 
                         print(f"    处理第{batch_idx+1}/{len(img_batches)}组 ({len(img_batch)}张)")
-
-                        # 步骤1: 创建Grid块
                         grid_block = converter._create_grid_block(column_size=len(img_batch))
                         grid_blocks_info = uploader.add_blocks_to_document(document_id, [grid_block])
-
                         if not grid_blocks_info:
                             print(f"      [X] 创建Grid块失败")
                             continue
 
-                        # 步骤2: 从响应中提取Grid块的ID和自动生成的GridColumn子块ID
                         grid_block_info = grid_blocks_info[0]
-                        grid_block_id = grid_block_info['block_id']
                         grid_column_ids = grid_block_info.get('children', [])
-
                         if len(grid_column_ids) != len(img_batch):
-                            print(f"      [X] GridColumn数量不匹配: 预期{len(img_batch)}, 实际{len(grid_column_ids)}")
+                            print(f"      [X] GridColumn数量不匹配")
                             continue
 
                         print(f"      [OK] Grid块创建成功，包含{len(grid_column_ids)}个分栏列")
                         time.sleep(0.2)
 
-                        # 步骤3: 在每个GridColumn下创建图片块
-                        image_upload_tasks = []  # 收集需要上传的图片任务
-
-                        for img_idx, (img_item, column_id) in enumerate(zip(img_batch, grid_column_ids)):
-                            # 3.1 在GridColumn下创建空图片块
+                        image_upload_tasks = []
+                        for img_idx, ((_, img_item, image_path), column_id) in enumerate(zip(img_batch, grid_column_ids)):
                             empty_image_block = converter._create_image_block(img_item, {})
                             image_blocks_info = uploader.add_blocks_to_document(
-                                document_id,
-                                [empty_image_block],
-                                parent_id=column_id  # 指定GridColumn ID作为父块
+                                document_id, [empty_image_block], parent_id=column_id
                             )
-
                             if not image_blocks_info:
                                 print(f"        [X] 创建图片块失败")
                                 continue
-
                             image_block_id = image_blocks_info[0]['block_id']
-                            image_path = images_dir / img_item['path'].replace('images/', '')
-
-                            if not image_path.exists():
-                                print(f"        [X] 图片不存在: {image_path}")
-                                continue
-
-                            # 收集上传任务
                             image_upload_tasks.append((image_path, document_id, image_block_id))
 
-                        # 步骤4: 并发上传所有图片
                         if image_upload_tasks:
                             print(f"      [INFO] 并发上传 {len(image_upload_tasks)} 张图片...")
-
-                            results = uploader.upload_images_batch_parallel(
-                                image_upload_tasks,
-                                max_workers=3
-                            )
-
-                            # 统计结果
+                            results = uploader.upload_images_batch_parallel(image_upload_tasks, max_workers=3)
                             success_count = sum(1 for r in results if r['success'])
                             fail_count = len(results) - success_count
-
                             print(f"      [OK] 上传完成: {success_count} 成功, {fail_count} 失败")
-
-                            # 显示失败的图片
+                            processed += success_count
                             for result in results:
                                 if not result['success']:
                                     print(f"        [X] {Path(result['path']).name}: {result['error']}")
 
-                        time.sleep(0.2)  # Grid之间保留延迟
+                        time.sleep(0.2)
 
-                    processed += len(consecutive_images)
-                    batch_start_idx = j
-
-                    # 标记后续图片为已处理
-                    for skip_idx in consecutive_indices[1:]:
-                        if skip_idx < len(parsed_data):
-                            parsed_data[skip_idx] = {'type': 'skip'}
-
-                else:
-                    # 单张图片,按原逻辑处理
-                    print(f"  [{idx+1}/{total_items}] 处理图片: {item['path']}")
-
-                    # 1. 创建空图片块
-                    image_block = [block]
+                elif len(valid_consecutive_images) == 1:
+                    valid_index, valid_item, image_path = valid_consecutive_images[0]
+                    print(f"  [{idx+1}/{total_items}] 处理图片: {valid_item['path']}")
+                    image_block = [blocks[valid_index]]
                     blocks_info = uploader.add_blocks_to_document(document_id, image_block)
-
-                    if not blocks_info:
+                    if blocks_info:
+                        image_block_id = blocks_info[0]['block_id']
+                        try:
+                            uploader.upload_image_to_block(image_path, document_id, image_block_id)
+                            print(f"    [OK] 图片上传成功")
+                            processed += 1
+                        except Exception as e:
+                            print(f"    [X] 上传失败: {e}")
+                            uploader.delete_block(document_id, image_block_id)
+                    else:
                         print(f"    [X] 创建图片块失败")
-                        batch_start_idx = idx + 1
-                        continue
-
-                    image_block_id = blocks_info[0]['block_id']
-
-                    # 2. 上传图片到该块
-                    image_path = images_dir / item['path'].replace('images/', '')
-                    if not image_path.exists():
-                        print(f"    [X] 图片不存在: {image_path}")
-                        batch_start_idx = idx + 1
-                        continue
-
-                    try:
-                        uploader.upload_image_to_block(image_path, document_id, image_block_id)
-                        print(f"    [OK] 图片上传成功")
-                        processed += 1
-                    except Exception as e:
-                        print(f"    [X] 上传失败: {e}")
-
-                    batch_start_idx = idx + 1
-                    time.sleep(0.3)  # 避免API限流
-            elif item['type'] == 'skip':
-                # 跳过已在Grid中处理的图片
-                continue
-            elif item['type'] == 'table':
-                # 表格：先提交批次，然后创建表格块并填充内容
-                if batch:
-                    print(f"  添加批次 ({batch_start_idx+1}-{batch_start_idx+len(batch)})...")
-                    uploader.add_blocks_to_document(document_id, batch)
-                    processed += len(batch)
-                    batch = []
-                    batch_start_idx = idx
                     time.sleep(0.3)
+                else:
+                    print(f"  [{idx+1}-{j}/{total_items}] 当前连续图片组全部跳过")
 
+                batch_start_idx = j
+                for skip_idx, _ in consecutive_images[1:]:
+                    if skip_idx < len(parsed_data):
+                        parsed_data[skip_idx] = {'type': 'skip'}
+
+            elif item['type'] == 'skip':
+                continue
+
+            # === Markdown 表格处理 ===
+            elif item['type'] == 'table':
                 print(f"  [{idx+1}/{total_items}] 处理表格...")
-
-                # 检查是否是特殊标记的表格块
                 if block.get('_special_type') == 'markdown_table':
                     table_data = block['item']
                     headers = table_data['headers']
                     rows = table_data['rows']
-
                     try:
-                        # 使用新方法创建带内容的表格
-                        table_block_id = uploader.create_table_with_content(
-                            document_id, headers, rows
-                        )
-
+                        table_block_id = uploader.create_table_with_content(document_id, headers, rows)
                         if table_block_id:
                             print(f"    [OK] 表格添加成功 ({len(headers)} 列 × {len(rows)+1} 行)")
+                            try:
+                                col_widths = calc_col_widths([headers] + rows)
+                                uploader.update_table_column_widths(
+                                    document_id, table_block_id, len(headers),
+                                    col_widths=col_widths
+                                )
+                                print(f"    [OK] 表格列宽已调整 ({col_widths})")
+                            except Exception as e:
+                                print(f"    [WARN] 列宽调整失败（不影响内容）: {e}")
                             processed += 1
                         else:
                             print(f"    [X] 表格创建失败")
                     except Exception as e:
                         print(f"    [X] 表格处理失败: {e}")
-
-                    batch_start_idx = idx + 1
-                    time.sleep(0.5)  # 表格操作较多，延迟稍长
                 else:
-                    # 旧格式的表格块（不应该出现）
                     print(f"    [X] 不支持的表格格式")
-                    batch_start_idx = idx + 1
+                batch_start_idx = idx + 1
+                time.sleep(0.5)
+
+            # === HTML 表格处理 ===
+            elif item['type'] == 'html_table':
+                print(f"  [{idx+1}/{total_items}] 处理 HTML 表格...")
+                if block.get('_special_type') == 'html_table':
+                    parsed_table = block['parsed']
+                    try:
+                        table_block_id = uploader.create_rich_table(
+                            document_id, parsed_table, converter
+                        )
+                        if table_block_id:
+                            print(f"    [OK] HTML 表格添加成功 ({parsed_table['col_count']} 列 × {parsed_table['row_count']} 行)")
+                            try:
+                                # 从 HTML 表格的 cells 数据计算每列内容长度
+                                html_rows = []
+                                for row in parsed_table.get('cells', []):
+                                    text_row = []
+                                    for cell in row:
+                                        cell_text = ''
+                                        for block_item in (cell if isinstance(cell, list) else []):
+                                            for seg in block_item.get('segments', []):
+                                                cell_text += seg.get('text', '')
+                                        text_row.append(cell_text)
+                                    html_rows.append(text_row)
+                                col_widths = calc_col_widths(html_rows)
+                                uploader.update_table_column_widths(
+                                    document_id, table_block_id, parsed_table['col_count'],
+                                    col_widths=col_widths
+                                )
+                                print(f"    [OK] 表格列宽已调整 ({col_widths})")
+                            except Exception as e:
+                                print(f"    [WARN] 列宽调整失败（不影响内容）: {e}")
+                            processed += 1
+                        else:
+                            print(f"    [X] HTML 表格创建失败")
+                    except Exception as e:
+                        print(f"    [X] HTML 表格处理失败: {e}")
+                batch_start_idx = idx + 1
+                time.sleep(0.5)
+
+            # === Mermaid 处理 ===
+            elif item['type'] == 'mermaid':
+                print(f"  [{idx+1}/{total_items}] 处理 Mermaid 图...")
+                if block.get('_special_type') == 'mermaid':
+                    # 先插入 fallback 代码块
+                    fallback_block = block['fallback_block']
+                    try:
+                        fb_info = uploader.add_blocks_to_document(document_id, [fallback_block])
+                        fallback_block_id = fb_info[0]['block_id'] if fb_info else None
+                        print(f"    [OK] Mermaid 代码块已插入 (fallback)")
+                        processed += 1
+
+                        # 收集 mermaid 数据供 Tier 2 处理
+                        mermaid_blocks_data.append({
+                            'code': block['code'],
+                            'fallback_block_id': fallback_block_id
+                        })
+                    except Exception as e:
+                        print(f"    [X] Mermaid 代码块插入失败: {e}")
+                batch_start_idx = idx + 1
+                time.sleep(0.3)
+
             else:
-                # 非图片、非表格块：添加到批次
+                # 普通块：添加到批次
                 batch.append(block)
 
         # 提交最后一批
@@ -457,6 +607,8 @@ def sync_to_feishu(md_file_path: str) -> str:
     except Exception as e:
         print(f"[WARNING] 添加内容时出错: {e}")
         print(f"[INFO] 文档已创建，部分内容可能未能添加。")
+        import traceback
+        traceback.print_exc()
 
     print("\n" + "=" * 60)
     print(f"[SUCCESS] 同步完成！")
@@ -464,15 +616,28 @@ def sync_to_feishu(md_file_path: str) -> str:
     print(f"文档链接: {doc_url}")
     print("=" * 60)
 
+    # 输出结构化 JSON（包含 mermaid 数据供 Tier 2 处理）
+    if mermaid_blocks_data:
+        output = {
+            "status": "success",
+            "document_id": document_id,
+            "url": doc_url,
+            "title": doc_title,
+            "mermaid_blocks": mermaid_blocks_data
+        }
+        print("\n---MERMAID_DATA_START---")
+        print(json.dumps(output, ensure_ascii=False))
+        print("---MERMAID_DATA_END---")
+
     return doc_url
 
 
 def main():
     """命令行入口"""
     if len(sys.argv) < 2:
-        print("用法: python main.py <markdown-file-path>")
+        print("用法: python scripts/main.py <markdown-file-path>")
         print("\n示例:")
-        print('  python main.py "D:\\obsidian\\notes\\article.md"')
+        print('  python scripts/main.py "D:\\obsidian\\notes\\article.md"')
         sys.exit(1)
 
     md_file_path = sys.argv[1]

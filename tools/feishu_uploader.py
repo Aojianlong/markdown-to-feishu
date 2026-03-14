@@ -24,10 +24,14 @@ class FeishuUploader:
     CREATE_BLOCKS_URL = "https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}/blocks/{block_id}/children"
     # 更新块API
     UPDATE_BLOCK_URL = "https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}/blocks/{block_id}"
+    DELETE_BLOCK_URL = "https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}/blocks/{block_id}"
     # 文档权限设置API
     SET_PERMISSION_URL = "https://open.feishu.cn/open-apis/drive/v2/permissions/{token}/public"
     # Markdown/HTML 转换为块API
     CONVERT_MARKDOWN_URL = "https://open.feishu.cn/open-apis/docx/v1/documents/blocks/batch_convert"
+    DEFAULT_TIMEOUT = (10, 60)
+    MAX_RETRIES = 3
+    RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
     def __init__(self, app_id: str, app_secret: str):
         """
@@ -42,6 +46,97 @@ class FeishuUploader:
         self.token = None
         self.token_expire_time = 0
         self._token_lock = threading.Lock()  # 线程锁保护 token 刷新
+        self._thread_local = threading.local()
+
+    def _get_session(self) -> requests.Session:
+        """为当前线程复用一个 Session，避免并发时共享连接状态。"""
+        session = getattr(self._thread_local, 'session', None)
+        if session is None:
+            session = requests.Session()
+            self._thread_local.session = session
+        return session
+
+    def _get_retry_delay(self, attempt: int, response: Optional[requests.Response] = None) -> float:
+        """计算下一次重试前的等待时间。"""
+        if response is not None:
+            retry_after = response.headers.get('Retry-After')
+            if retry_after:
+                try:
+                    return max(float(retry_after), 0.0)
+                except ValueError:
+                    pass
+
+        return min(1.0 * (2 ** attempt), 8.0)
+
+    def _reset_file_streams(self, files: Any) -> None:
+        """重试前重置 multipart 文件指针。"""
+        if not files:
+            return
+
+        file_items = files.values() if isinstance(files, dict) else files
+        for file_item in file_items:
+            if isinstance(file_item, tuple) and len(file_item) >= 2:
+                file_obj = file_item[1]
+            else:
+                file_obj = file_item
+
+            if hasattr(file_obj, 'seek'):
+                file_obj.seek(0)
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        action: str,
+        retry_status_codes: Optional[set] = None,
+        timeout: Optional[Tuple[int, int]] = None,
+        **kwargs
+    ) -> requests.Response:
+        """
+        统一的 HTTP 请求入口，补齐超时和有限重试。
+        """
+        retry_status_codes = retry_status_codes or self.RETRYABLE_STATUS_CODES
+        timeout = timeout or self.DEFAULT_TIMEOUT
+        last_exception = None
+
+        for attempt in range(self.MAX_RETRIES + 1):
+            self._reset_file_streams(kwargs.get('files'))
+            try:
+                response = self._get_session().request(
+                    method,
+                    url,
+                    timeout=timeout,
+                    **kwargs
+                )
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                last_exception = exc
+                if attempt >= self.MAX_RETRIES:
+                    raise
+
+                delay = self._get_retry_delay(attempt)
+                print(
+                    f"  [RETRY] {action} 遇到网络错误，将在 {delay:.1f}s 后重试 "
+                    f"({attempt + 1}/{self.MAX_RETRIES})"
+                )
+                time.sleep(delay)
+                continue
+
+            if response.status_code in retry_status_codes and attempt < self.MAX_RETRIES:
+                delay = self._get_retry_delay(attempt, response=response)
+                print(
+                    f"  [RETRY] {action} 返回 HTTP {response.status_code}，将在 {delay:.1f}s 后重试 "
+                    f"({attempt + 1}/{self.MAX_RETRIES})"
+                )
+                time.sleep(delay)
+                continue
+
+            return response
+
+        if last_exception is not None:
+            raise last_exception
+
+        raise RuntimeError(f"{action} 失败：未获取到有效响应")
 
     def get_tenant_token(self) -> str:
         """
@@ -66,7 +161,12 @@ class FeishuUploader:
                 "app_secret": self.app_secret
             }
 
-            response = requests.post(self.AUTH_URL, json=payload)
+            response = self._request(
+                "POST",
+                self.AUTH_URL,
+                json=payload,
+                action="获取 tenant_access_token"
+            )
             response.raise_for_status()
 
             data = response.json()
@@ -141,11 +241,13 @@ class FeishuUploader:
             if parent_node:
                 data_fields['parent_node'] = parent_node
 
-            response = requests.post(
+            response = self._request(
+                "POST",
                 self.UPLOAD_IMAGE_URL,
                 headers=headers,
                 data=data_fields,
-                files={'file': (image_path.name, f, mime_type)}
+                files={'file': (image_path.name, f, mime_type)},
+                action=f"上传图片 {image_path.name}"
             )
 
         # 检查HTTP状态码
@@ -201,10 +303,12 @@ class FeishuUploader:
         if folder_token:
             payload['folder_token'] = folder_token
 
-        response = requests.post(
+        response = self._request(
+            "POST",
             self.CREATE_DOC_URL,
             headers=headers,
-            json=payload
+            json=payload,
+            action=f"创建文档 {title}"
         )
 
         response.raise_for_status()
@@ -276,7 +380,13 @@ class FeishuUploader:
             }
 
         try:
-            response = requests.patch(url, headers=headers, json=payload)
+            response = self._request(
+                "PATCH",
+                url,
+                headers=headers,
+                json=payload,
+                action="设置文档权限"
+            )
 
             if response.status_code != 200:
                 # 输出错误信息
@@ -331,7 +441,13 @@ class FeishuUploader:
             "children": blocks
         }
 
-        response = requests.post(url, headers=headers, json=payload)
+        response = self._request(
+            "POST",
+            url,
+            headers=headers,
+            json=payload,
+            action="添加文档块"
+        )
 
         # 添加错误调试
         if response.status_code != 200:
@@ -385,11 +501,13 @@ class FeishuUploader:
                 'size': str(image_path.stat().st_size)
             }
 
-            response = requests.post(
+            response = self._request(
+                "POST",
                 self.UPLOAD_IMAGE_URL,
                 headers=headers,
                 data=data_fields,
-                files={'file': (image_path.name, f, mime_type)}
+                files={'file': (image_path.name, f, mime_type)},
+                action=f"上传图片 {image_path.name} 到块"
             )
 
         # 检查HTTP状态码
@@ -451,7 +569,13 @@ class FeishuUploader:
             }
         }
 
-        response = requests.patch(url, headers=headers, json=payload)
+        response = self._request(
+            "PATCH",
+            url,
+            headers=headers,
+            json=payload,
+            action="绑定图片到块"
+        )
 
         if response.status_code != 200:
             try:
@@ -498,15 +622,23 @@ class FeishuUploader:
                     'success': True,
                     'data': result,
                     'path': str(image_path),
+                    'block_id': block_id,
                     'error': None
                 }
             except Exception as e:
+                cleanup_ok = self.delete_block(document_id, block_id)
+                error_message = str(e)
+                if cleanup_ok:
+                    error_message = f"{error_message}；已回滚空图片块"
+                else:
+                    error_message = f"{error_message}；回滚空图片块失败"
                 return {
                     'index': index,
                     'success': False,
                     'data': None,
-                    'error': str(e),
-                    'path': str(image_path)
+                    'error': error_message,
+                    'path': str(image_path),
+                    'block_id': block_id
                 }
 
         # 并发上传
@@ -545,7 +677,13 @@ class FeishuUploader:
             "format": "markdown"  # 指定为 Markdown 格式
         }
 
-        response = requests.post(self.CONVERT_MARKDOWN_URL, headers=headers, json=payload)
+        response = self._request(
+            "POST",
+            self.CONVERT_MARKDOWN_URL,
+            headers=headers,
+            json=payload,
+            action="转换 Markdown"
+        )
 
         if response.status_code != 200:
             try:
@@ -664,7 +802,13 @@ class FeishuUploader:
 
         print(f"  创建嵌套表格块: {row_count} 行 × {col_count} 列 = {len(cell_temp_ids)} 个单元格")
 
-        response = requests.post(url, headers=headers_dict, json=payload)
+        response = self._request(
+            "POST",
+            url,
+            headers=headers_dict,
+            json=payload,
+            action="创建嵌套表格"
+        )
 
         if response.status_code != 200:
             try:
@@ -696,6 +840,443 @@ class FeishuUploader:
 
         print(f"  表格块创建成功，ID: {table_block_id}")
         return table_block_id
+
+    def create_nested_list(self, document_id: str, list_items: List[Dict],
+                          converter=None) -> Optional[str]:
+        """
+        使用 descendant API 创建嵌套列表（有序或无序）
+
+        Args:
+            document_id: 文档 ID
+            list_items: 列表项列表，每项包含:
+                - type: 'ordered' 或 'bullet'
+                - indent: 缩进级别（0, 1, 2, ...）
+                - segments: 文本片段
+                - block (可选): 已构建的飞书 block
+            converter: BlockConverter 实例，用于转换 segments 到 text_run
+
+        Returns:
+            第一个列表块的 ID，失败返回 None
+        """
+        if not list_items:
+            return None
+
+        # 构建嵌套树结构
+        all_blocks = []
+        root_ids = []
+        children_map = {}  # temp_id -> [child_temp_ids]
+        stack = []  # [(indent, temp_id)]
+
+        for i, item in enumerate(list_items):
+            temp_id = f"list_{i}"
+            indent = item.get('indent', 0)
+
+            # pop 掉 indent >= 当前的条目
+            while stack and stack[-1][0] >= indent:
+                stack.pop()
+
+            if stack:
+                parent_id = stack[-1][1]
+                children_map.setdefault(parent_id, []).append(temp_id)
+            else:
+                root_ids.append(temp_id)
+
+            stack.append((indent, temp_id))
+
+            # 构建 block
+            if 'block' in item:
+                block = item['block'].copy()
+            else:
+                item_type = item.get('type', 'ordered')
+                if item_type == 'ordered':
+                    block_type = 13
+                    body_key = 'ordered'
+                else:
+                    block_type = 12
+                    body_key = 'bullet'
+
+                segments = item.get('segments', [{'text': item.get('content', ' ')}])
+                if converter:
+                    elements = converter._convert_text_elements(segments)
+                else:
+                    elements = [{"text_run": {"content": s.get('text', '')}} for s in segments]
+
+                block = {
+                    "block_type": block_type,
+                    body_key: {
+                        "elements": elements
+                    }
+                }
+
+            block["block_id"] = temp_id
+            all_blocks.append(block)
+
+        # 设置 children
+        for block in all_blocks:
+            tid = block["block_id"]
+            if tid in children_map:
+                block["children"] = children_map[tid]
+
+        # 调用 descendant API
+        token = self.get_tenant_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8"
+        }
+
+        url = f"https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}/blocks/{document_id}/descendant"
+
+        payload = {
+            "children_id": root_ids,
+            "index": -1,
+            "descendants": all_blocks
+        }
+
+        response = self._request(
+            "POST",
+            url,
+            headers=headers,
+            json=payload,
+            action="创建嵌套列表"
+        )
+
+        if response.status_code != 200:
+            try:
+                error_data = response.json()
+                print(f"  HTTP {response.status_code} - API response: {json.dumps(error_data, ensure_ascii=False, indent=2)}")
+            except:
+                print(f"  HTTP {response.status_code}: {response.text}")
+            raise Exception(f"创建嵌套列表失败: HTTP {response.status_code}")
+
+        result = response.json()
+        if result.get('code') != 0:
+            raise Exception(f"创建嵌套列表失败: {result.get('msg')}")
+
+        return root_ids[0] if root_ids else None
+
+    def create_rich_table(self, document_id: str, table_data: Dict,
+                          converter=None) -> Optional[str]:
+        """
+        创建含富文本内容的表格（支持单元格内嵌套列表、加粗等）
+
+        Args:
+            document_id: 文档 ID
+            table_data: 由 HtmlTableParser.parse() 返回的表格数据
+            converter: BlockConverter 实例
+
+        Returns:
+            表格块 ID，失败返回 None
+        """
+        row_count = table_data['row_count']
+        col_count = table_data['col_count']
+        cells = table_data['cells']
+
+        if row_count == 0 or col_count == 0:
+            return None
+
+        # 构建所有临时 ID
+        cell_temp_ids = []
+        for r in range(row_count):
+            for c in range(col_count):
+                cell_temp_ids.append(f"cell_{r}_{c}")
+
+        # 表格块
+        table_block = {
+            "block_id": "table_temp_id",
+            "block_type": 31,
+            "table": {
+                "property": {
+                    "row_size": row_count,
+                    "column_size": col_count
+                }
+            },
+            "children": cell_temp_ids
+        }
+
+        all_blocks = [table_block]
+        temp_id_counter = [0]
+
+        def next_temp_id(prefix: str) -> str:
+            temp_id_counter[0] += 1
+            return f"{prefix}_{temp_id_counter[0]}"
+
+        def convert_segments(segments):
+            """将 segments 转为飞书 text_run 元素"""
+            if converter:
+                return converter._convert_text_elements(segments)
+            elements = []
+            for s in segments:
+                element = {"text_run": {"content": s.get('text', '')}}
+                style = {}
+                if s.get('bold'):
+                    style['bold'] = True
+                if s.get('italic'):
+                    style['italic'] = True
+                if s.get('link'):
+                    from urllib.parse import quote
+                    style['link'] = {'url': quote(s['link'], safe=':/?#[]@!$&\'()*+,;=')}
+                if s.get('inline_code'):
+                    style['inline_code'] = True
+                if style:
+                    element['text_run']['text_element_style'] = style
+                elements.append(element)
+            return elements
+
+        def build_cell_children(cell_content: List[Dict]) -> tuple:
+            """构建单元格的子块，返回 (children_ids, blocks)"""
+            child_ids = []
+            child_blocks = []
+
+            # 分组：连续的列表项作为一组处理
+            i = 0
+            while i < len(cell_content):
+                item = cell_content[i]
+                item_type = item.get('type', 'text')
+
+                if item_type == 'text':
+                    tid = next_temp_id("txt")
+                    segments = item.get('segments', [{'text': ' '}])
+                    block = {
+                        "block_id": tid,
+                        "block_type": 2,
+                        "text": {
+                            "elements": convert_segments(segments)
+                        }
+                    }
+                    child_ids.append(tid)
+                    child_blocks.append(block)
+                    i += 1
+
+                elif item_type in ('ordered', 'bullet'):
+                    # 收集连续的同类型列表项
+                    list_group = []
+                    while i < len(cell_content) and cell_content[i].get('type') in ('ordered', 'bullet'):
+                        list_group.append(cell_content[i])
+                        i += 1
+
+                    # 构建嵌套列表树
+                    list_root_ids, list_blocks = build_nested_list_blocks(list_group)
+                    child_ids.extend(list_root_ids)
+                    child_blocks.extend(list_blocks)
+                else:
+                    i += 1
+
+            # 至少有一个子块
+            if not child_ids:
+                tid = next_temp_id("empty")
+                block = {
+                    "block_id": tid,
+                    "block_type": 2,
+                    "text": {
+                        "elements": [{"text_run": {"content": " "}}]
+                    }
+                }
+                child_ids.append(tid)
+                child_blocks.append(block)
+
+            return child_ids, child_blocks
+
+        def build_nested_list_blocks(list_items: List[Dict]) -> tuple:
+            """构建嵌套列表块，返回 (root_ids, all_blocks)"""
+            blocks = []
+            root_ids = []
+            children_map = {}
+            stack = []
+
+            for item in list_items:
+                tid = next_temp_id("li")
+                indent = item.get('indent', 0)
+
+                while stack and stack[-1][0] >= indent:
+                    stack.pop()
+
+                if stack:
+                    parent_id = stack[-1][1]
+                    children_map.setdefault(parent_id, []).append(tid)
+                else:
+                    root_ids.append(tid)
+
+                stack.append((indent, tid))
+
+                item_type = item.get('type', 'ordered')
+                block_type = 13 if item_type == 'ordered' else 12
+                body_key = 'ordered' if item_type == 'ordered' else 'bullet'
+
+                segments = item.get('segments', [{'text': ' '}])
+                block = {
+                    "block_id": tid,
+                    "block_type": block_type,
+                    body_key: {
+                        "elements": convert_segments(segments)
+                    }
+                }
+                blocks.append(block)
+
+            # 设置 children
+            for block in blocks:
+                tid = block["block_id"]
+                if tid in children_map:
+                    block["children"] = children_map[tid]
+
+            return root_ids, blocks
+
+        # 构建所有单元格块
+        for r in range(row_count):
+            for c in range(col_count):
+                cell_temp_id = f"cell_{r}_{c}"
+                cell_content = cells[r][c] if r < len(cells) and c < len(cells[r]) else []
+
+                child_ids, child_blocks = build_cell_children(cell_content)
+
+                cell_block = {
+                    "block_id": cell_temp_id,
+                    "block_type": 32,
+                    "table_cell": {},
+                    "children": child_ids
+                }
+                all_blocks.append(cell_block)
+                all_blocks.extend(child_blocks)
+
+        # 调用 descendant API
+        token = self.get_tenant_token()
+        headers_dict = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8"
+        }
+
+        url = f"https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}/blocks/{document_id}/descendant"
+
+        payload = {
+            "children_id": ["table_temp_id"],
+            "index": -1,
+            "descendants": all_blocks
+        }
+
+        total_blocks = len(all_blocks)
+        print(f"  创建富文本表格: {row_count} 行 × {col_count} 列, 共 {total_blocks} 个块")
+
+        response = self._request(
+            "POST",
+            url,
+            headers=headers_dict,
+            json=payload,
+            action="创建富文本表格"
+        )
+
+        if response.status_code != 200:
+            try:
+                error_data = response.json()
+                print(f"  HTTP {response.status_code} - API response: {json.dumps(error_data, ensure_ascii=False, indent=2)}")
+            except:
+                print(f"  HTTP {response.status_code}: {response.text}")
+            raise Exception(f"创建富文本表格失败: HTTP {response.status_code}")
+
+        result = response.json()
+        if result.get('code') != 0:
+            raise Exception(f"创建富文本表格失败: {result.get('msg')}")
+
+        # 获取实际表格块 ID
+        block_id_relations = result.get('data', {}).get('block_id_relations', [])
+        table_block_id = None
+        for relation in block_id_relations:
+            if relation.get('temporary_block_id') == 'table_temp_id':
+                table_block_id = relation.get('block_id')
+                break
+
+        print(f"  表格块创建成功，ID: {table_block_id}")
+        return table_block_id
+
+    def update_table_column_widths(self, document_id: str, table_block_id: str,
+                                    col_count: int, col_widths: List[int] = None,
+                                    total_width: int = 1093):
+        """
+        设置表格各列宽度（按比例或均匀分布）
+
+        Args:
+            document_id: 文档 ID
+            table_block_id: 表格块 ID
+            col_count: 列数
+            col_widths: 每列宽度列表(px)，为 None 时均匀分布
+            total_width: 总宽度(px)，默认 780
+        """
+        if col_widths is None:
+            col_widths = [max(50, total_width // col_count)] * col_count
+
+        token = self.get_tenant_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        url = self.UPDATE_BLOCK_URL.format(
+            document_id=document_id,
+            block_id=table_block_id
+        )
+
+        for col_idx in range(col_count):
+            payload = {
+                "update_table_property": {
+                    "column_width": col_widths[col_idx],
+                    "column_index": col_idx
+                }
+            }
+            try:
+                response = self._request(
+                    "PATCH", url, headers=headers, json=payload,
+                    action=f"设置表格第{col_idx+1}列宽度"
+                )
+                if response.status_code != 200:
+                    print(f"    列宽设置失败(列{col_idx}): HTTP {response.status_code}")
+                    break
+                result = response.json()
+                if result.get('code') != 0:
+                    print(f"    列宽设置失败(列{col_idx}): {result.get('msg')}")
+                    break
+            except Exception as e:
+                print(f"    列宽设置异常(列{col_idx}): {e}")
+                break
+            time.sleep(0.35)
+
+    def delete_block(self, document_id: str, block_id: str) -> bool:
+        """
+        删除文档块，用于图片上传失败后的回滚。
+        """
+        token = self.get_tenant_token()
+        headers = {
+            "Authorization": f"Bearer {token}"
+        }
+        url = self.DELETE_BLOCK_URL.format(
+            document_id=document_id,
+            block_id=block_id
+        )
+
+        try:
+            response = self._request(
+                "DELETE",
+                url,
+                headers=headers,
+                action="删除文档块"
+            )
+        except Exception as e:
+            print(f"  [WARNING] 删除空图片块失败: {e}")
+            return False
+
+        if response.status_code not in (200, 204):
+            print(f"  [WARNING] 删除空图片块失败 - HTTP {response.status_code}")
+            return False
+
+        if response.status_code == 204 or not response.content:
+            return True
+
+        try:
+            result = response.json()
+        except ValueError:
+            return True
+
+        if result.get('code') != 0:
+            print(f"  [WARNING] 删除空图片块失败: {result.get('msg')}")
+            return False
+
+        return True
 
     def create_document_with_content(self, title: str, blocks: List[Dict]) -> str:
         """

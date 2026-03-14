@@ -5,6 +5,7 @@ Block 格式转换器
 
 from typing import List, Dict, Optional
 from urllib.parse import quote
+from tools.html_parser import HtmlTableParser
 
 
 class BlockConverter:
@@ -95,6 +96,10 @@ class BlockConverter:
                 blocks.append(self._create_code_block(item))
             elif item_type == 'table':
                 blocks.append(self._create_table_block(item))
+            elif item_type == 'html_table':
+                blocks.append(self._create_html_table_block(item))
+            elif item_type == 'mermaid':
+                blocks.append(self._create_mermaid_block(item))
             elif item_type == 'task':
                 blocks.append(self._create_task_block(item))
 
@@ -153,37 +158,13 @@ class BlockConverter:
         }
 
     def _create_ordered_block(self, item: Dict) -> Dict:
-        """
-        创建有序列表 Block
-
-        由于飞书的有序列表在被其他内容打断后会重新编号,
-        我们将有序列表转换为文本块,手动添加序号和缩进,这样可以:
-        1. 保留原始序号
-        2. 通过空格缩进显示层级关系
-        """
+        """创建原生有序列表 Block (block_type 13)"""
         segments = item.get('segments', [{'text': item['content']}])
-        number = item.get('number', 1)
-        indent = item.get('indent', 0)
 
-        # 计算缩进级别(每4个空格为一级)
-        indent_level = indent // 4
-
-        # 在第一个segment前添加序号和缩进
-        indent_spaces = "    " * indent_level  # 每级缩进4个空格
-
-        if segments:
-            first_seg = segments[0].copy()
-            # 添加缩进和序号
-            first_seg['text'] = f"{indent_spaces}{number}. {first_seg['text']}"
-            new_segments = [first_seg] + segments[1:]
-        else:
-            new_segments = [{'text': f"{indent_spaces}{number}. {item['content']}"}]
-
-        # 使用普通文本块,保留格式
         return {
-            "block_type": 2,  # 文本块
-            "text": {
-                "elements": self._convert_text_elements(new_segments)
+            "block_type": 13,  # 原生有序列表
+            "ordered": {
+                "elements": self._convert_text_elements(segments)
             }
         }
 
@@ -368,6 +349,26 @@ class BlockConverter:
             "_special_type": "markdown_table",  # 特殊标记
             "markdown": markdown_text,
             "item": item  # 保留原始数据以备用
+        }
+
+    def _create_html_table_block(self, item: Dict) -> Dict:
+        """创建 HTML 表格 Block（使用特殊标记，在 main.py 中处理）"""
+        parser = HtmlTableParser()
+        parsed = parser.parse(item['html'])
+        return {
+            "_special_type": "html_table",
+            "parsed": parsed
+        }
+
+    def _create_mermaid_block(self, item: Dict) -> Dict:
+        """创建 Mermaid Block（fallback 代码块 + 特殊标记）"""
+        return {
+            "_special_type": "mermaid",
+            "code": item['content'],
+            "fallback_block": self._create_code_block({
+                'language': 'mermaid',
+                'content': item['content']
+            })
         }
 
     def _create_task_block(self, item: Dict) -> Dict:

@@ -4,14 +4,10 @@
 """
 
 import sys
-import json
 import getpass
-from pathlib import Path
 
 from tools.feishu_uploader import FeishuUploader
-
-
-CONFIG_PATH = Path(__file__).parent / 'config.json'
+from config_utils import CONFIG_PATH, load_json_config, save_json_config
 
 
 def init_config():
@@ -59,8 +55,7 @@ def init_config():
     }
 
     # 保存配置
-    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
+    save_json_config(CONFIG_PATH, config)
 
     print("\n✅ 配置已保存到:", CONFIG_PATH)
 
@@ -79,12 +74,11 @@ def test_connection(quiet=False):
     # 检查配置文件
     if not CONFIG_PATH.exists():
         print("❌ 配置文件不存在！")
-        print("请先运行: python setup.py init")
+        print("请先运行: python scripts/setup.py init")
         sys.exit(1)
 
     # 加载配置
-    with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-        config = json.load(f)
+    config = load_json_config(CONFIG_PATH)
 
     app_id = config['feishu']['app_id']
     app_secret = config['feishu']['app_secret']
@@ -120,11 +114,10 @@ def show_config():
 
     if not CONFIG_PATH.exists():
         print("❌ 配置文件不存在！")
-        print("请先运行: python setup.py init")
+        print("请先运行: python scripts/setup.py init")
         return
 
-    with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-        config = json.load(f)
+    config = load_json_config(CONFIG_PATH)
 
     print("\n飞书配置:")
     print(f"  App ID: {config['feishu']['app_id']}")
@@ -139,9 +132,9 @@ def main():
     """命令行入口"""
     if len(sys.argv) < 2:
         print("用法:")
-        print("  python setup.py init   - 初始化配置")
-        print("  python setup.py test   - 测试连接")
-        print("  python setup.py show   - 显示配置")
+        print("  python scripts/setup.py init   - 初始化配置")
+        print("  python scripts/setup.py test   - 测试连接")
+        print("  python scripts/setup.py show   - 显示配置")
         sys.exit(1)
 
     command = sys.argv[1]

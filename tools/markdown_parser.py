@@ -72,6 +72,9 @@ class MarkdownParser:
         with open(md_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
 
+        # 预扫描 HTML 表格范围
+        html_table_ranges = self._find_html_table_ranges(lines)
+
         result = []
         i = 0
         in_quote_block = False
@@ -83,6 +86,23 @@ class MarkdownParser:
         while i < len(lines):
             line = lines[i].rstrip('\n')
 
+            # HTML 表格检测（优先于其他解析）
+            if i in html_table_ranges:
+                # 先结束引用块
+                if in_quote_block:
+                    result.append({
+                        'type': 'quote',
+                        'content': '\n'.join(quote_lines)
+                    })
+                    quote_lines = []
+                    in_quote_block = False
+
+                end = html_table_ranges[i]
+                html = '\n'.join(l.rstrip('\n') for l in lines[i:end + 1])
+                result.append({'type': 'html_table', 'html': html})
+                i = end + 1
+                continue
+
             # 检测代码块开始/结束
             if line.strip().startswith('```'):
                 if not in_code_block:
@@ -93,11 +113,17 @@ class MarkdownParser:
                 else:
                     # 结束代码块
                     in_code_block = False
-                    result.append({
-                        'type': 'code',
-                        'language': code_language,
-                        'content': '\n'.join(code_lines)
-                    })
+                    if code_language.lower() == 'mermaid':
+                        result.append({
+                            'type': 'mermaid',
+                            'content': '\n'.join(code_lines)
+                        })
+                    else:
+                        result.append({
+                            'type': 'code',
+                            'language': code_language,
+                            'content': '\n'.join(code_lines)
+                        })
                     code_lines = []
                     code_language = ''
                 i += 1
@@ -482,6 +508,41 @@ class MarkdownParser:
             return [seg]
 
         return segments
+
+    def _find_html_table_ranges(self, lines: List[str]) -> Dict[int, int]:
+        """
+        预扫描文件，找出所有 HTML <table>...</table> 的行号范围
+
+        Returns:
+            {start_line_index: end_line_index, ...}
+        """
+        ranges = {}
+        i = 0
+        while i < len(lines):
+            line = lines[i].rstrip('\n').strip()
+            if line.startswith('<table') and not line.startswith('```'):
+                start = i
+                # 找到配对的 </table>
+                depth = 0
+                j = i
+                while j < len(lines):
+                    l = lines[j].rstrip('\n').strip()
+                    # 简单计数 <table 和 </table> 以支持嵌套
+                    if l.startswith('<table'):
+                        depth += 1
+                    if '</table>' in l:
+                        depth -= 1
+                        if depth == 0:
+                            ranges[start] = j
+                            i = j + 1
+                            break
+                    j += 1
+                else:
+                    # 没找到闭合标签，跳过
+                    i += 1
+            else:
+                i += 1
+        return ranges
 
     def _parse_table(self, table_lines: List[str]) -> Optional[Dict]:
         """
